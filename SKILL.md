@@ -36,9 +36,13 @@ is omitted, ask the user for it — do not guess. If `from`/`to` are missing, as
    python3 <skill-directory>/scripts/collect.py --from <from> --to <to>
    ```
    It prints, grouped by **local-time day**, the commits and the user's typed
-   prompts in range. (It auto-derives the project root via `git rev-parse` and
-   maps it to `~/.claude/projects/<path-with-slashes-as-dashes>/`. Pass
-   `--project-root <path>` to override.)
+   prompts in range. (It auto-derives the project root via `git rev-parse`, then
+   gathers chat history from **every worktree** of the repo — the main checkout
+   plus any `git worktree` / nested `.claude/worktrees/…` workspaces. Each
+   candidate session dir is verified by the `cwd` recorded inside its JSONL — not
+   by its encoded folder name, which is lossy and case-variant — so sibling
+   projects aren't pulled in by mistake. The header lists every dir scanned.
+   Pass `--project-root <path>` to override the root.)
 
    **Multi-author repos:** by default the helper filters `git log` to the
    **current git user** (`git config user.email`, falling back to `user.name`),

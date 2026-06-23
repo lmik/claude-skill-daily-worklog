@@ -48,47 +48,151 @@ def local_date(ts):
     dt = datetime.fromisoformat(ts.replace("Z", "+00:00")).astimezone()
     return dt.strftime("%Y-%m-%d"), dt.strftime("%H:%M")
 
-def projects_dir_for(project_root):
+def encode_path(p):
     # Claude Code encodes the project dir name by replacing every non-alphanumeric
     # character (/, ., +, …) with "-", not just slashes — must match exactly or
     # paths with dots (GeoBis.Mobile, .claude) or worktrees (feature+741) won't resolve.
-    enc = re.sub(r"[^a-zA-Z0-9]", "-", str(Path(project_root).resolve()))
-    return Path.home() / ".claude" / "projects" / enc
+    return re.sub(r"[^a-zA-Z0-9]", "-", str(Path(p).resolve()))
 
-def collect_prompts(jsonl_dir, dfrom, dto):
-    days = {}
-    if not jsonl_dir.is_dir():
-        return days, f"(no chat history dir at {jsonl_dir})"
+def projects_root():
+    return Path.home() / ".claude" / "projects"
+
+def git_common_dir(path):
+    """Absolute .git common dir for `path`, or None. All worktrees of one repo
+    share this value, so it's a casing-/location-proof identity for the repo."""
+    try:
+        out = subprocess.check_output(
+            ["git", "-C", str(path), "rev-parse", "--git-common-dir"],
+            text=True, stderr=subprocess.DEVNULL).strip()
+    except (subprocess.CalledProcessError, OSError):
+        return None
+    if not out:
+        return None
+    # `out` is relative to `path` (e.g. ".git") for the main checkout and
+    # absolute for linked worktrees; os.path.join keeps absolute paths intact.
+    return str(Path(os.path.join(str(path), out)).resolve())
+
+def git_worktree_paths(project_root):
+    """Paths of worktrees git currently knows about (incl. ones living outside
+    the repo tree). Trusted directly — git already vouches for them."""
+    try:
+        out = subprocess.check_output(
+            ["git", "-C", str(project_root), "worktree", "list", "--porcelain"],
+            text=True, stderr=subprocess.DEVNULL)
+    except (subprocess.CalledProcessError, OSError):
+        return []
+    return [ln[len("worktree "):].strip()
+            for ln in out.splitlines() if ln.startswith("worktree ")]
+
+def recorded_cwd(jsonl_dir):
+    """The cwd a session dir's history was recorded in (first record carrying
+    one). Used to verify which repo/worktree a dir actually belongs to, since
+    the encoded dir NAME is lossy (repo/x and repo-x collide) and case-variant."""
     for jf in sorted(jsonl_dir.glob("*.jsonl")):
         try:
-            fh = jf.open(encoding="utf-8")
+            with jf.open(encoding="utf-8") as fh:
+                for i, line in enumerate(fh):
+                    if i > 50:            # cwd appears in the opening records
+                        break
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        cwd = json.loads(line).get("cwd")
+                    except json.JSONDecodeError:
+                        continue
+                    if cwd:
+                        return cwd
         except OSError:
             continue
-        with fh:
-            for line in fh:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    obj = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                ts = obj.get("timestamp", "")
-                if not ts:
-                    continue
-                txt = user_text(obj)
-                if txt is None or is_noise(txt):
-                    continue
-                try:
-                    day, hm = local_date(ts)
-                except ValueError:
-                    continue
-                if day < dfrom or day > dto:
-                    continue
-                snippet = " ".join(txt.split())
-                if len(snippet) > 280:
-                    snippet = snippet[:280] + " …[truncated]"
-                days.setdefault(day, []).append((hm, jf.name, snippet))
+    return None
+
+def _same_repo(cwd, root, root_common):
+    """Does a recorded cwd belong to the repo at `root`?"""
+    cwd_path = Path(cwd)
+    if cwd_path.exists() and root_common:
+        gc = git_common_dir(cwd_path)
+        if gc is not None:
+            return gc == root_common      # definitive — survives casing/relocation
+    # cwd gone (deleted worktree) or git unavailable: best-effort path containment
+    c = str(cwd_path).rstrip("/").lower()
+    r = str(root).rstrip("/").lower()
+    return c == r or c.startswith(r + "/")
+
+def session_dirs_for(project_root):
+    """All ~/.claude/projects/* dirs holding chat history for this repo and any
+    of its worktrees, as a deduped list. Union of two sources:
+      1. prefix-glob on the encoded repo path (catches the main checkout plus
+         worktrees nested in the repo — e.g. .claude/worktrees/… — including
+         ones since deleted), each VERIFIED against its recorded cwd; and
+      2. `git worktree list` (catches currently-existing worktrees stored
+         outside the repo tree that the prefix can't reach).
+    Known gap: a worktree that lived OUTSIDE the repo tree AND was deleted before
+    runtime is unrecoverable — its dir shares no prefix and git no longer lists it.
+    """
+    root = Path(project_root).resolve()
+    pr = projects_root()
+    root_common = git_common_dir(root)
+    found = {}  # resolved dir path -> dir (dedupes the two sources)
+
+    # source 1: prefix-glob, then verify by recorded cwd (name alone is untrusted)
+    enc_low = encode_path(root).lower()
+    if pr.is_dir():
+        for d in pr.iterdir():
+            if not d.is_dir():
+                continue
+            n = d.name.lower()
+            if n != enc_low and not n.startswith(enc_low + "-"):
+                continue
+            cwd = recorded_cwd(d)
+            if cwd is not None and _same_repo(cwd, root, root_common):
+                found[d.resolve()] = d
+
+    # source 2: worktrees git currently knows about (trusted, may be external)
+    for wt in git_worktree_paths(root):
+        d = pr / encode_path(wt)
+        if d.is_dir():
+            found[d.resolve()] = d
+
+    return sorted(found.values(), key=lambda p: p.name)
+
+def collect_prompts(jsonl_dirs, dfrom, dto):
+    days = {}
+    if not jsonl_dirs:
+        return days, "(no chat history dirs found for this repo)"
+    for jsonl_dir in jsonl_dirs:
+        if not jsonl_dir.is_dir():
+            continue
+        for jf in sorted(jsonl_dir.glob("*.jsonl")):
+            try:
+                fh = jf.open(encoding="utf-8")
+            except OSError:
+                continue
+            with fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        obj = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    ts = obj.get("timestamp", "")
+                    if not ts:
+                        continue
+                    txt = user_text(obj)
+                    if txt is None or is_noise(txt):
+                        continue
+                    try:
+                        day, hm = local_date(ts)
+                    except ValueError:
+                        continue
+                    if day < dfrom or day > dto:
+                        continue
+                    snippet = " ".join(txt.split())
+                    if len(snippet) > 280:
+                        snippet = snippet[:280] + " …[truncated]"
+                    days.setdefault(day, []).append((hm, jf.name, snippet))
     for d in days:
         days[d].sort()
     return days, None
@@ -164,14 +268,19 @@ def main():
         cur = current_git_author(root)
         authors = [cur] if cur else None
 
-    jsonl_dir = projects_dir_for(root)
-    prompts, warn = collect_prompts(jsonl_dir, args.dfrom, args.dto)
+    jsonl_dirs = session_dirs_for(root)
+    prompts, warn = collect_prompts(jsonl_dirs, args.dfrom, args.dto)
     commits = collect_commits(root, args.dfrom, args.dto, authors)
 
     all_days = sorted(set(prompts) | set(commits))
     print(f"# Raw signal {args.dfrom} … {args.dto}")
     print(f"# project root: {root}")
-    print(f"# chat history: {jsonl_dir}")
+    if jsonl_dirs:
+        print(f"# chat history ({len(jsonl_dirs)} worktree dir(s)):")
+        for d in jsonl_dirs:
+            print(f"#   {d}")
+    else:
+        print("# chat history: (none found)")
     if args.all_authors:
         print("# commit author filter: ALL authors")
     elif authors:
